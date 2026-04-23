@@ -16,6 +16,12 @@ header h1 { font-size: 18px; margin: 0; }
 header h1 a { text-decoration: none; color: var(--fg); }
 header nav a { margin-right: 16px; color: var(--muted); text-decoration: none; }
 header nav a:hover { color: var(--accent); }
+header .health { margin-left: auto; font-size: 12px; padding: 4px 10px; border-radius: 12px; display: inline-flex; align-items: center; gap: 6px; }
+header .health.ok      { background: #e6f8ec; color: #1e7f39; }
+header .health.warn    { background: #fff5de; color: #996600; }
+header .health.err     { background: #fde9e9; color: #b00020; }
+header .health.unknown { background: #eef0f4; color: #5c6370; }
+header .health button { background: transparent; border: 0; cursor: pointer; color: inherit; padding: 0; font-size: 13px; }
 main { max-width: 1080px; margin: 24px auto; padding: 0 24px; }
 section { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }
 h2 { margin: 0 0 12px; font-size: 16px; }

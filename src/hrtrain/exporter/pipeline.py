@@ -1,23 +1,33 @@
-"""Post-training export pipeline.
+"""Post-training artifact export.
 
-Collects the latest checkpoint, optionally exports ONNX, renders a rollout
-video, and regenerates motion files (BVH/FBX/CSV) from the learned policy.
+Runs on the remote host:
+  - Pick the latest `model_*.pt` from the rsl_rl run dir
+  - Invoke ONNX export helper (if present)
+  - Render a rollout video via `play.py`
+  - Dump rollout qpos → CSV (via a tiny remote one-liner)
 
-Each sub-step is a best-effort: failure logs the error but does not abort
-the overall export, so users still get partial artifacts.
+Then downloads each produced file to the local Job workspace so the Web UI
+can serve it directly.
 """
 from __future__ import annotations
 
 import logging
-import subprocess
-from pathlib import Path
+import re
+import shlex
+from pathlib import Path, PurePosixPath
 
 from ..config import settings
+from ..remote import Host
 
 log = logging.getLogger(__name__)
 
 
-async def run_exports(job_id: int, run_dir: Path, workspace: Path) -> dict[str, Path | None]:
+async def run_exports(
+    host: Host,
+    remote_job_dir: str,
+    remote_run_dir: str,
+    local_job_dir: Path,
+) -> dict[str, Path | None]:
     out: dict[str, Path | None] = {
         "checkpoint_path": None,
         "onnx_path": None,
@@ -26,102 +36,132 @@ async def run_exports(job_id: int, run_dir: Path, workspace: Path) -> dict[str, 
         "motion_fbx_path": None,
         "motion_csv_path": None,
     }
-    latest_pt = _find_latest_checkpoint(run_dir)
-    if latest_pt is not None:
-        out["checkpoint_path"] = latest_pt
-        onnx = workspace / "policy.onnx"
-        if _export_onnx(latest_pt, onnx):
-            out["onnx_path"] = onnx
 
-    video = _render_rollout(run_dir, latest_pt, workspace)
-    if video is not None:
-        out["video_path"] = video
-        bvh, fbx, csv = _extract_motion(video, workspace)
-        out["motion_bvh_path"] = bvh
-        out["motion_fbx_path"] = fbx
-        out["motion_csv_path"] = csv
+    latest_remote_pt = await _find_latest_checkpoint(host, remote_run_dir)
+    if latest_remote_pt:
+        local_pt = local_job_dir / Path(latest_remote_pt).name
+        try:
+            await host.download(latest_remote_pt, local_pt)
+            out["checkpoint_path"] = local_pt
+        except Exception:
+            log.exception("failed to download checkpoint")
+
+        remote_onnx = str(PurePosixPath(remote_job_dir) / "policy.onnx")
+        if await _try_export_onnx(host, latest_remote_pt, remote_onnx):
+            local_onnx = local_job_dir / "policy.onnx"
+            try:
+                await host.download(remote_onnx, local_onnx)
+                out["onnx_path"] = local_onnx
+            except Exception:
+                log.exception("failed to download onnx")
+
+    remote_video = await _try_render_rollout(host, remote_run_dir, latest_remote_pt)
+    if remote_video:
+        local_video = local_job_dir / "rollout.mp4"
+        try:
+            await host.download(remote_video, local_video)
+            out["video_path"] = local_video
+        except Exception:
+            log.exception("failed to download video")
+
+    remote_csv = await _try_qpos_csv(host, remote_run_dir)
+    if remote_csv:
+        local_csv = local_job_dir / "motion.csv"
+        try:
+            await host.download(remote_csv, local_csv)
+            out["motion_csv_path"] = local_csv
+        except Exception:
+            log.exception("failed to download motion csv")
+
+    # BVH/FBX export from rig qpos: placeholder — requires a G1 rig-aware
+    # Blender script; scheduled for a follow-up commit.
 
     return out
 
 
-def _find_latest_checkpoint(run_dir: Path) -> Path | None:
-    cands = sorted(run_dir.rglob("model_*.pt"),
-                   key=lambda p: int(p.stem.split("_")[-1]) if p.stem.split("_")[-1].isdigit() else -1)
-    return cands[-1] if cands else None
-
-
-def _export_onnx(pt_path: Path, onnx_path: Path) -> bool:
-    """Invoke rsl_rl's export helper (if available).
-
-    Upstream `rsl_rl` has a `play.py --export_policy_onnx` path.  We shell out
-    because the infrastructure is already set up for subprocess training.
-    """
-    export_script = settings.unitree_rl_lab_root / "scripts" / "rsl_rl" / "export_onnx.py"
-    if not export_script.exists():
-        log.warning("No export_onnx.py script; skipping ONNX export")
-        return False
-    conda_sh = settings.conda_root / "etc" / "profile.d" / "conda.sh"
-    cmd = (
-        f"source {conda_sh} && conda activate {settings.conda_env_isaaclab} && "
-        f"python {export_script} --checkpoint {pt_path} --output {onnx_path}"
+async def _find_latest_checkpoint(host: Host, remote_run_dir: str) -> str | None:
+    r = await host.exec(
+        f"shopt -s globstar nullglob; ls {shlex.quote(remote_run_dir)}/**/model_*.pt 2>/dev/null",
+        timeout=15,
     )
-    r = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        log.warning("ONNX export failed: %s", r.stderr[-500:])
+    if not r.ok or not r.stdout.strip():
+        return None
+    candidates = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+    def iter_num(p: str) -> int:
+        m = re.search(r"model_(\d+)\.pt$", p)
+        return int(m.group(1)) if m else -1
+
+    candidates.sort(key=iter_num)
+    return candidates[-1] if candidates else None
+
+
+async def _try_export_onnx(host: Host, pt_path: str, onnx_path: str) -> bool:
+    driver = f"{settings.unitree_rl_lab_root}/scripts/rsl_rl/export_onnx.py"
+    r = await host.exec(f"test -f {shlex.quote(driver)} && echo yes || echo no", timeout=15)
+    if r.stdout.strip() != "yes":
+        log.info("no export_onnx.py on remote; skipping")
         return False
-    return onnx_path.exists()
+    conda = f"source {settings.conda_root}/etc/profile.d/conda.sh && conda activate {settings.conda_env_isaaclab}"
+    cmd = (
+        f"{conda} && python {shlex.quote(driver)} "
+        f"--checkpoint {shlex.quote(pt_path)} --output {shlex.quote(onnx_path)}"
+    )
+    r = await host.exec(cmd, timeout=300)
+    if not r.ok:
+        log.warning("onnx export failed: %s", r.stderr[-500:])
+        return False
+    return True
 
 
-def _render_rollout(run_dir: Path, pt_path: Path | None, workspace: Path) -> Path | None:
+async def _try_render_rollout(host: Host, remote_run_dir: str, pt_path: str | None) -> str | None:
     if pt_path is None:
         return None
-    play_script = settings.unitree_rl_lab_root / "scripts" / "rsl_rl" / "play.py"
-    if not play_script.exists():
-        log.warning("No play.py; skipping rollout video")
+    play = f"{settings.unitree_rl_lab_root}/scripts/rsl_rl/play.py"
+    r = await host.exec(f"test -f {shlex.quote(play)} && echo yes || echo no", timeout=15)
+    if r.stdout.strip() != "yes":
         return None
-    out_mp4 = workspace / "rollout.mp4"
-    conda_sh = settings.conda_root / "etc" / "profile.d" / "conda.sh"
+    conda = f"source {settings.conda_root}/etc/profile.d/conda.sh && conda activate {settings.conda_env_isaaclab}"
+    # Reuse the same task embedded in pt metadata — caller already validated it exists.
     cmd = (
-        f"source {conda_sh} && conda activate {settings.conda_env_isaaclab} && "
-        f"cd {settings.isaaclab_root} && "
-        f"python {play_script} --num_envs 1 --headless --video --video_length 1500 "
-        f"--checkpoint {pt_path}"
+        f"{conda} && cd {shlex.quote(settings.isaaclab_root)} && "
+        f"python {shlex.quote(play)} --num_envs 1 --headless --video --video_length 1500 "
+        f"--checkpoint {shlex.quote(pt_path)}"
     )
-    r = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=900)
-    if r.returncode != 0:
-        log.warning("Rollout video render failed: %s", r.stderr[-500:])
+    r = await host.exec(cmd, timeout=900)
+    if not r.ok:
+        log.warning("rollout video render failed: %s", r.stderr[-500:])
         return None
-    vids = sorted(run_dir.rglob("videos/*.mp4"), key=lambda p: p.stat().st_mtime)
-    if not vids:
+    # Find the produced mp4 — play.py writes it under the run dir's videos/ subfolder.
+    r = await host.exec(
+        f"shopt -s globstar nullglob; ls -t {shlex.quote(remote_run_dir)}/**/*.mp4 2>/dev/null | head -1",
+        timeout=15,
+    )
+    path = r.stdout.strip()
+    return path or None
+
+
+async def _try_qpos_csv(host: Host, remote_run_dir: str) -> str | None:
+    # play.py may save `qpos.npz` alongside the mp4 if patched; convert to CSV.
+    r = await host.exec(
+        f"shopt -s globstar nullglob; ls {shlex.quote(remote_run_dir)}/**/*.qpos.npz 2>/dev/null | head -1",
+        timeout=15,
+    )
+    qpos_npz = r.stdout.strip()
+    if not qpos_npz:
         return None
-    vids[-1].replace(out_mp4)
-    return out_mp4
-
-
-def _extract_motion(video_path: Path, workspace: Path) -> tuple[Path | None, Path | None, Path | None]:
-    """Convert the learned policy's rollout back to motion files.
-
-    The rollout produces a qpos trajectory (saved alongside the MP4 by play.py
-    via a small patch).  We emit CSV directly, and use Blender to export BVH
-    and FBX from a reconstructed G1 skeleton.  These last two steps are
-    optional — users get the CSV regardless.
-    """
-    qpos_npz = video_path.with_suffix(".qpos.npz")
-    csv_path: Path | None = None
-    if qpos_npz.exists():
-        csv_path = workspace / "motion.csv"
-        try:
-            import numpy as np
-            data = np.load(qpos_npz)["qpos"]
-            header = ",".join(
-                ["base_x", "base_y", "base_z", "qw", "qx", "qy", "qz"]
-                + [f"j{i:02d}" for i in range(data.shape[1] - 7)]
-            )
-            np.savetxt(csv_path, data, delimiter=",", header=header, comments="")
-        except Exception:
-            log.exception("CSV export failed")
-            csv_path = None
-
-    # BVH/FBX export requires a separate Blender script (to be added alongside
-    # the G1 rig skeleton file).  Stubbed here.
-    return (None, None, csv_path)
+    conda = f"source {settings.conda_root}/etc/profile.d/conda.sh && conda activate {settings.conda_env_isaaclab}"
+    out_csv = str(PurePosixPath(qpos_npz).with_suffix("").with_suffix(".csv"))
+    snippet = (
+        "import numpy as np, sys; "
+        "p_in=sys.argv[1]; p_out=sys.argv[2]; "
+        "q=np.load(p_in)['qpos']; "
+        "header=','.join(['bx','by','bz','qw','qx','qy','qz']+[f'j{i:02d}' for i in range(q.shape[1]-7)]); "
+        "np.savetxt(p_out, q, delimiter=',', header=header, comments='')"
+    )
+    cmd = f"{conda} && python -c {shlex.quote(snippet)} {shlex.quote(qpos_npz)} {shlex.quote(out_csv)}"
+    r = await host.exec(cmd, timeout=120)
+    if not r.ok:
+        log.warning("qpos csv export failed: %s", r.stderr[-500:])
+        return None
+    return out_csv

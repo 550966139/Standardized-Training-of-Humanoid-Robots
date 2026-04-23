@@ -1,22 +1,24 @@
-"""Thin wrapper over the `general_motion_retargeting` (GMR) package.
+"""Call GMR retargeter on the remote host.
 
-GMR lives in the `gmr` conda env (MuJoCo + Mink IK solver).  We do not import
-it into the FastAPI process; instead we invoke it as a subprocess with a
-serialised intermediate file so we keep env isolation.
+Flow:
+  1. Upload canonical `.npz` from our local tempdir to `<remote_workdir>/jobs/<id>/`
+  2. Invoke humanoid-choreo's `scripts/run_gmr_retarget.py` in `conda_env_gmr`
+  3. Return the remote path of the resulting G1 qpos `.npz`
 
-Input:  canonical MotionData dumped to a temporary .npz (positions, rotations, fps)
-Output: G1MotionSequence .npz with keys {qpos, qvel, fps, ik_residual, source_meta}
+If the upstream driver script is missing we raise a clear error — the caller
+should surface that into the Job's status so the user sees it in the UI.
 """
 from __future__ import annotations
 
-import json
-import subprocess
-from pathlib import Path
+import shlex
+import tempfile
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 
 from ..config import settings
 from ..loaders.base import MotionData
+from ..remote import Host
 
 
 def _dump_canonical(motion: MotionData, path: Path) -> None:
@@ -31,50 +33,44 @@ def _dump_canonical(motion: MotionData, path: Path) -> None:
     )
 
 
-def retarget_to_g1(
+async def retarget_to_g1(
+    host: Host,
     motion: MotionData,
-    out_path: Path,
+    remote_job_dir: str,
+    *,
     actual_human_height: float = 1.7,
     src_human_profile: str = "bvh_lafan1",
-) -> Path:
-    """Run GMR in the dedicated conda env and produce a G1 qpos sequence.
+) -> str:
+    """Upload canonical motion, run GMR on remote, return remote output path."""
+    remote_canonical = str(PurePosixPath(remote_job_dir) / "canonical.npz")
+    remote_output = str(PurePosixPath(remote_job_dir) / "g1_motion.npz")
 
-    NOTE: when executed during training orchestration we usually receive
-    MotionData directly from a loader.  This helper is synchronous and
-    blocking; call from an executor if you need async behaviour.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    canonical_path = out_path.with_suffix(".canonical.npz")
-    _dump_canonical(motion, canonical_path)
+    await host.mkdir(remote_job_dir)
 
-    script = (settings.hc_root / "scripts" / "run_gmr_retarget.py")
-    if not script.exists():
+    with tempfile.TemporaryDirectory() as td:
+        local_canonical = Path(td) / "canonical.npz"
+        _dump_canonical(motion, local_canonical)
+        await host.upload(local_canonical, remote_canonical)
+
+    driver = f"{settings.hc_root}/scripts/run_gmr_retarget.py"
+    check = await host.exec(f"test -f {shlex.quote(driver)} && echo yes || echo no", timeout=15)
+    if check.stdout.strip() != "yes":
         raise FileNotFoundError(
-            f"Missing upstream GMR driver script: {script}. "
-            "Install humanoid-choreo and provide scripts/run_gmr_retarget.py that accepts "
+            f"Missing upstream GMR driver on remote: {driver}. "
+            "Add scripts/run_gmr_retarget.py to humanoid-choreo that accepts "
             "`--input <canonical.npz> --output <g1.npz> --src <profile> --height <float>`."
         )
 
-    conda_sh = settings.conda_root / "etc" / "profile.d" / "conda.sh"
     cmd = (
-        f"source {conda_sh} && conda activate {settings.conda_env_gmr} && "
-        f"python {script} --input {canonical_path} --output {out_path} "
-        f"--src {src_human_profile} --height {actual_human_height}"
+        f"source {settings.conda_root}/etc/profile.d/conda.sh && "
+        f"conda activate {settings.conda_env_gmr} && "
+        f"python {shlex.quote(driver)} "
+        f"--input {shlex.quote(remote_canonical)} "
+        f"--output {shlex.quote(remote_output)} "
+        f"--src {shlex.quote(src_human_profile)} "
+        f"--height {actual_human_height:.3f}"
     )
-    result = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError(f"GMR retargeting failed:\n{result.stderr[-1000:]}")
-    return out_path
-
-
-def read_gmr_output(path: Path) -> dict:
-    with np.load(path, allow_pickle=True) as zf:
-        data = {k: zf[k] for k in zf.files}
-    # Normalise metadata json
-    if "source_meta_json" in data:
-        meta_raw = str(data["source_meta_json"][0]) if data["source_meta_json"].shape else ""
-        try:
-            data["source_meta"] = json.loads(meta_raw)
-        except Exception:
-            data["source_meta"] = {}
-    return data
+    r = await host.exec(cmd, timeout=600)
+    if not r.ok:
+        raise RuntimeError(f"GMR retarget failed:\n{r.stderr[-1500:]}")
+    return remote_output

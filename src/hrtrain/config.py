@@ -17,15 +17,23 @@ class Settings(BaseSettings):
     data_root: Path = Field(default=Path("data"))
     db_url: str = "sqlite+aiosqlite:///data/hrtrain.db"
 
-    # Upstream dependencies (paths on the AutoDL host)
-    isaaclab_root: Path = Field(default=Path("/root/autodl-tmp/IsaacLab"))
-    unitree_rl_lab_root: Path = Field(default=Path("/root/autodl-tmp/unitree_rl_lab"))
-    hc_root: Path = Field(default=Path("/root/autodl-tmp/humanoid-choreo"))
+    # Upstream dependencies — remote POSIX paths (kept as str so Windows
+    # doesn't substitute backslashes when the Web UI runs locally).
+    isaaclab_root: str = "/root/autodl-tmp/IsaacLab"
+    unitree_rl_lab_root: str = "/root/autodl-tmp/unitree_rl_lab"
+    hc_root: str = "/root/autodl-tmp/humanoid-choreo"
     conda_env_isaaclab: str = "hc-isaac"
-    conda_env_gmr: str = "gmr"
-    conda_root: Path = Field(default=Path("/root/miniconda3"))
+    conda_env_gmr: str = "hc-isaac"   # falls back to hc-isaac until a dedicated gmr env exists
+    conda_root: str = "/root/miniconda3"
 
     blender_bin: str = "blender"
+
+    # Remote execution (defaults target the AutoDL instance used in development)
+    remote_enabled: bool = True
+    remote_host: str = "connect.bjb2.seetacloud.com"
+    remote_port: int = 51501
+    remote_user: str = "root"
+    remote_workdir: str = "/root/autodl-tmp/hrtrain_remote"
 
     # File upload limit (bytes) — 500 MB default
     max_upload_bytes: int = 500 * 1024 * 1024

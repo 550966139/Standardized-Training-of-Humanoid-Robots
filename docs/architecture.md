@@ -40,18 +40,33 @@ One FastAPI process hosts everything except the training subprocess:
                                                    └───────────────────┘
 ```
 
-## Conda environment contract
+## Local Web + Remote Training 拓扑
 
-The web server runs in its own venv (Python 3.10).  It never imports Isaac
-Lab or MuJoCo.  Heavy work is delegated via subprocess to:
+```
+           本机 (Windows/Mac/Linux)         AutoDL 服务器 (GPU)
+ ┌────────────────────────────────┐   ┌──────────────────────────────┐
+ │ Browser → http://127.0.0.1:6006│   │ conda env hc-isaac           │
+ │                                │   │ IsaacSim 4.5 + Isaac Lab 2.3│
+ │ FastAPI (hrtrain)              │SSH│ unitree_rl_lab              │
+ │ ├─ Loaders (BVH/SMPL/AMASS/FBX)│━━▶│ humanoid-choreo (GMR)       │
+ │ ├─ host = RemoteHost (ssh/scp) │◀━━│ GPU 训练 rsl_rl              │
+ │ ├─ SQLite job store            │   │ play.py 渲染 MP4             │
+ │ └─ data/outputs/<job>/ ← scp ──┼───┤ checkpoint / ONNX / log      │
+ └────────────────────────────────┘   └──────────────────────────────┘
+```
+
+只有 Web + 解析器 + 编排代码在本机,GPU 相关全部远程。重启本机 Web 不影响远程训练进程(都是 nohup 守护的)。
+
+## Conda environment contract (on AutoDL)
+
+hrtrain 本身不加载 Isaac Lab / MuJoCo,而是通过 SSH 调用远端脚本:
 
 | Env name    | Used for                                | Path                                  |
 |-------------|-----------------------------------------|---------------------------------------|
 | `hc-isaac`  | Isaac Lab + unitree_rl_lab + rsl_rl    | /root/miniconda3/envs/hc-isaac        |
-| `gmr`       | GMR retargeting (MuJoCo + mink)        | /root/miniconda3/envs/gmr             |
+| (同上)       | GMR retarget(在 hc-isaac 里直接跑 MuJoCo + mink,省一个 env) | 同上 |
 
-Each subprocess sources `~/miniconda3/etc/profile.d/conda.sh`, activates the
-right env, and invokes the corresponding upstream script.
+每次远端 exec 都走 `bash -l -c "source conda.sh && conda activate <env> && <cmd>"`。
 
 ## Data flow per job
 

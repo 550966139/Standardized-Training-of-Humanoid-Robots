@@ -10,13 +10,38 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header>
+  <header x-data="health" x-init="refresh()">
     <h1><a href="/">HR&nbsp;Train</a></h1>
     <nav>
       <a href="/">任务列表</a>
       <a href="#upload">上传动捕</a>
     </nav>
+    <span class="health" :class="status">
+      <span x-text="summary"></span>
+      <button type="button" @click="refresh" title="重新检测">↻</button>
+    </span>
   </header>
+  <script>
+  document.addEventListener('alpine:init', () => {
+    Alpine.data('health', () => ({
+      status: 'unknown', summary: '…',
+      async refresh() {
+        this.summary = '检测中…'; this.status = 'unknown';
+        try {
+          const r = await fetch('/health'); const j = await r.json();
+          if (j.ssh_ok) {
+            const bad = ['isaaclab','unitree_rl_lab','humanoid_choreo'].filter(k => j[k] !== 'yes');
+            if (bad.length) { this.status = 'warn'; this.summary = `后端缺失: ${bad.join(',')}`; }
+            else { this.status = 'ok'; this.summary = `后端就绪 · ${j.remote_host}`; }
+          } else {
+            this.status = 'err';
+            this.summary = 'SSH 不通: ' + (j.ssh_error || j.remote_host);
+          }
+        } catch(e) { this.status = 'err'; this.summary = '健康检查失败'; }
+      }
+    }));
+  });
+  </script>
   <main>
     {% block content %}{% endblock %}
   </main>

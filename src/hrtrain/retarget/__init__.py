@@ -1,4 +1,4 @@
-"""Retargeting canonical motion → robot joint trajectory."""
+"""Retargeting: canonical motion → robot joint trajectory (remote GMR)."""
 from .gmr_wrapper import retarget_to_g1
 from .to_train_npz import write_training_npz
 

@@ -1,77 +1,60 @@
-"""Launch `rsl_rl` training from unitree_rl_lab in the `hc-isaac` conda env.
-
-Returns the run directory (so we can tail TensorBoard events) and the PID of
-the spawned Python process.
-"""
+"""Start rsl_rl training on the remote host, detached."""
 from __future__ import annotations
 
-import os
 import shlex
-import subprocess
-import time
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from ..config import settings
+from ..remote import Host
 
 
-def run_rsl_rl_train(
+@dataclass
+class TrainHandle:
+    remote_run_dir: str
+    remote_log: str
+    pid: int
+
+
+async def run_rsl_rl_train(
+    host: Host,
+    *,
     task: str,
     num_envs: int,
     max_iterations: int,
-    motion_npz: Path,
-    workspace: Path,
-) -> tuple[Path, int]:
-    """Spawn training as a detached subprocess. Returns (run_dir, pid)."""
-    isaac_base = settings.conda_root / "envs" / settings.conda_env_isaaclab / \
-        "lib" / "python3.10" / "site-packages" / "isaacsim"
-    # Populate LD_LIBRARY_PATH from every `bin/` under isaacsim (same pattern
-    # used by the existing train_mimic_dance.sh script).
-    extra_libs = ":".join(str(p) for p in isaac_base.glob("**/bin") if p.is_dir())
+    remote_motion_npz: str,
+    remote_workspace: str,
+) -> TrainHandle:
+    remote_run_dir = str(PurePosixPath(remote_workspace) / "rsl_rl_run")
+    remote_log = str(PurePosixPath(remote_workspace) / "train.log")
 
-    conda_sh = settings.conda_root / "etc" / "profile.d" / "conda.sh"
-    train_script = settings.unitree_rl_lab_root / "scripts" / "rsl_rl" / "train.py"
-    if not train_script.exists():
-        raise FileNotFoundError(f"Missing {train_script}")
+    conda = f"source {settings.conda_root}/etc/profile.d/conda.sh && conda activate {settings.conda_env_isaaclab}"
+    # Emulate the pattern used by existing train_mimic_dance.sh — populate LD_LIBRARY_PATH
+    # from every /bin/ under the isaacsim install.
+    isaac_lib_setup = (
+        f"ISAAC_BASE={shlex.quote(f'{settings.conda_root}/envs/{settings.conda_env_isaaclab}/lib/python3.10/site-packages/isaacsim')}; "
+        r"""EXTRA_LIBS=$(find "$ISAAC_BASE" -name bin -type d 2>/dev/null | tr '\n' ':'); """
+        r"""export LD_LIBRARY_PATH="${EXTRA_LIBS}${LD_LIBRARY_PATH:-}"; """
+    )
 
-    run_dir = workspace / "rsl_rl_run"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    log_path = workspace / "train.log"
-
-    # Patch the mimic task to consume our custom motion_npz by writing an env var
-    # that the task config can read.  Upstream tasks/mimic/robots/g1_29dof/dance_*/
-    # should support `HRTRAIN_MOTION_NPZ` — to be added in that repo.
-    env_pairs = {
+    env_vars = {
         "OMNI_KIT_ACCEPT_EULA": "YES",
         "PRIVACY_CONSENT": "Y",
-        "HRTRAIN_MOTION_NPZ": str(motion_npz),
-        "HRTRAIN_RUN_DIR": str(run_dir),
-        "LD_LIBRARY_PATH": f"{extra_libs}:${{LD_LIBRARY_PATH:-}}",
+        "HRTRAIN_MOTION_NPZ": remote_motion_npz,
+        "HRTRAIN_RUN_DIR": remote_run_dir,
     }
-    env_setup = " && ".join(f"export {k}={shlex.quote(v)}" for k, v in env_pairs.items())
+    env_setup = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
 
+    train_script = f"{settings.unitree_rl_lab_root}/scripts/rsl_rl/train.py"
     cmd = (
-        f"source {conda_sh} && conda activate {settings.conda_env_isaaclab} && "
-        f"{env_setup} && cd {settings.isaaclab_root} && "
-        f"python {train_script} "
-        f"--task {task} --num_envs {num_envs} --headless --logger tensorboard "
-        f"--max_iterations {max_iterations} "
-        f">> {shlex.quote(str(log_path))} 2>&1"
+        f"{conda} && {isaac_lib_setup} "
+        f"mkdir -p {shlex.quote(remote_run_dir)} && "
+        f"cd {shlex.quote(settings.isaaclab_root)} && "
+        f"{env_setup} python {shlex.quote(train_script)} "
+        f"--task {shlex.quote(task)} "
+        f"--num_envs {num_envs} --headless --logger tensorboard "
+        f"--max_iterations {max_iterations}"
     )
 
-    proc = subprocess.Popen(
-        ["bash", "-lc", cmd],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    # Leave some time for python to boot and materialise the run dir.
-    time.sleep(2)
-    return run_dir, proc.pid
-
-
-def is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    pid = await host.exec_detached(cmd, log_remote=remote_log)
+    return TrainHandle(remote_run_dir=remote_run_dir, remote_log=remote_log, pid=pid)

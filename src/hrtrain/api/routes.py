@@ -14,6 +14,7 @@ from ..config import settings
 from ..db import get_session
 from ..loaders import detect_format
 from ..models import Job, JobStatus, UploadedFile
+from ..remote import health_check
 from ..trainer.manager import manager
 
 router = APIRouter()
@@ -26,6 +27,11 @@ async def index(request: Request, sess: AsyncSession = Depends(get_session)):
     result = await sess.execute(select(Job).order_by(Job.created_at.desc()))
     jobs = result.scalars().all()
     return templates.TemplateResponse(request, "index.html", {"jobs": jobs})
+
+
+@router.get("/health")
+async def health():
+    return await health_check()
 
 
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)

@@ -1,40 +1,38 @@
-"""Asynchronous job manager.
-
-One job at a time (GPU is exclusive).  A background worker coroutine pops
-queued jobs and runs:  prepare (loader + retarget + train-npz) → train
-(subprocess) → export (checkpoint + onnx + mp4 + motion files).
-
-Progress is broadcast via `asyncio.Queue`s per job id so the SSE endpoint can
-stream updates to the browser.
-"""
+"""Orchestrate jobs: local Web → remote training → local artifact downloads."""
 from __future__ import annotations
 
 import asyncio
 import logging
-import signal
 import time
 from collections.abc import AsyncIterator
-from pathlib import Path
-
-from sqlalchemy import select
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 
 from ..config import settings
 from ..db import SessionLocal
 from ..loaders import load as load_mocap
 from ..models import Job, JobStatus, UploadedFile
+from ..remote import Host, get_host
 from ..retarget import retarget_to_g1, write_training_npz
-from .progress import parse_event_file
-from .runner import run_rsl_rl_train
+from .progress import poll_iter
+from .runner import TrainHandle, run_rsl_rl_train
 
 log = logging.getLogger(__name__)
 
 
 class JobManager:
+    """Single-queue, single-worker orchestrator.
+
+    One job at a time because the remote GPU is exclusive.  All remote state
+    lives under `{remote_workdir}/jobs/{job_id}/`.
+    """
+
     def __init__(self) -> None:
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._listeners: dict[int, list[asyncio.Queue[dict]]] = {}
         self._worker_task: asyncio.Task | None = None
-        self._running_proc: int | None = None
+        self._active_handle: TrainHandle | None = None
+        self._active_job_id: int | None = None
 
     # ----- lifecycle -----
     async def start(self) -> None:
@@ -56,14 +54,20 @@ class JobManager:
         await self._emit(job_id, {"event": "queued"})
 
     async def cancel(self, job_id: int) -> bool:
-        if self._running_proc == job_id and self._running_pid:
-            try:
-                import os
-                os.kill(self._running_pid, signal.SIGTERM)
-                return True
-            except OSError:
-                return False
-        return False
+        if self._active_job_id != job_id or self._active_handle is None:
+            return False
+        host = get_host()
+        try:
+            await host.exec(f"kill -TERM {self._active_handle.pid} 2>/dev/null", timeout=15)
+        except Exception:
+            return False
+        async with SessionLocal() as sess:
+            job = await sess.get(Job, job_id)
+            if job:
+                job.status = JobStatus.cancelled
+                await sess.commit()
+        await self._emit(job_id, {"event": "cancelled"})
+        return True
 
     async def listen(self, job_id: int) -> AsyncIterator[dict]:
         q: asyncio.Queue[dict] = asyncio.Queue()
@@ -78,18 +82,22 @@ class JobManager:
             self._listeners.get(job_id, []).remove(q)
 
     # ----- internals -----
-    _running_pid: int | None = None
-
     async def _worker(self) -> None:
         while True:
             job_id = await self._queue.get()
+            self._active_job_id = job_id
             try:
                 await self._run_job(job_id)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Job %s crashed", job_id)
                 await self._mark_failed(job_id, repr(exc))
+            finally:
+                self._active_job_id = None
+                self._active_handle = None
 
     async def _run_job(self, job_id: int) -> None:
+        host = get_host()
+
         async with SessionLocal() as sess:
             job = await sess.get(Job, job_id)
             if job is None:
@@ -97,70 +105,79 @@ class JobManager:
             upload = await sess.get(UploadedFile, job.upload_id)
             if upload is None:
                 raise RuntimeError("upload missing")
-            workspace = settings.jobs_dir / f"job_{job_id:06d}"
-            workspace.mkdir(parents=True, exist_ok=True)
-            job.workspace_dir = str(workspace)
             job.status = JobStatus.preparing
             await sess.commit()
         await self._emit(job_id, {"event": "preparing"})
 
-        # 1. Load mocap → canonical
+        # Remote job workspace
+        remote_job_dir = str(PurePosixPath(settings.remote_workdir) / "jobs" / f"job_{job_id:06d}")
+        await host.mkdir(remote_job_dir)
+
+        # Local job workspace (for downloaded artifacts)
+        local_job_dir = settings.outputs_dir / f"job_{job_id:06d}"
+        local_job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Stamp paths
+        async with SessionLocal() as sess:
+            job = await sess.get(Job, job_id)
+            job.workspace_dir = str(local_job_dir)
+            await sess.commit()
+
+        # 1) Load locally (loaders are pure python, no GPU needed)
         motion = load_mocap(Path(upload.stored_path))
-        log.info("Loaded mocap: %s frames, %s joints, fps=%s",
-                 motion.num_frames, motion.num_joints, motion.fps)
-        await self._emit(job_id, {"event": "loaded", "frames": motion.num_frames,
-                                  "fps": motion.fps, "joints": motion.num_joints})
+        await self._emit(job_id, {
+            "event": "loaded",
+            "frames": motion.num_frames,
+            "joints": motion.num_joints,
+            "fps": motion.fps,
+        })
 
-        # 2. GMR retarget → G1 qpos
-        gmr_out = workspace / "g1_motion.npz"
-        retarget_to_g1(motion, gmr_out)
-        await self._emit(job_id, {"event": "retargeted"})
+        # 2) Retarget on remote
+        remote_g1_npz = await retarget_to_g1(host, motion, remote_job_dir)
+        await self._emit(job_id, {"event": "retargeted", "path": remote_g1_npz})
 
-        # 3. Training npz
-        train_npz = workspace / "train_motion.npz"
-        write_training_npz(gmr_out, train_npz)
-        await self._emit(job_id, {"event": "train_npz_ready", "path": str(train_npz)})
+        # 3) Build training npz on remote
+        remote_train_npz = await write_training_npz(host, remote_g1_npz, remote_job_dir)
+        await self._emit(job_id, {"event": "train_npz_ready", "path": remote_train_npz})
 
-        # 4. Training subprocess
+        # 4) Start training (detached remote subprocess)
         async with SessionLocal() as sess:
             job = await sess.get(Job, job_id)
             job.status = JobStatus.training
             job.progress_total = job.max_iterations
-            from datetime import datetime
             job.started_at = datetime.utcnow()
             await sess.commit()
-
         await self._emit(job_id, {"event": "training_started"})
-        self._running_proc = job_id
-        run_dir, pid = run_rsl_rl_train(
-            task=job.task, num_envs=job.num_envs,
-            max_iterations=job.max_iterations,
-            motion_npz=train_npz,
-            workspace=workspace,
-        )
-        self._running_pid = pid
 
-        # Poll training progress from TensorBoard events
+        handle = await run_rsl_rl_train(
+            host,
+            task=job.task,
+            num_envs=job.num_envs,
+            max_iterations=job.max_iterations,
+            remote_motion_npz=remote_train_npz,
+            remote_workspace=remote_job_dir,
+        )
+        self._active_handle = handle
+        async with SessionLocal() as sess:
+            job = await sess.get(Job, job_id)
+            job.pid = handle.pid
+            await sess.commit()
+
+        # 5) Poll progress
         while True:
-            await asyncio.sleep(10)
-            iter_now = parse_event_file(run_dir)
+            await asyncio.sleep(15)
+            alive = await host.is_pid_alive(handle.pid)
+            step = await poll_iter(host, handle.remote_run_dir)
             async with SessionLocal() as sess:
                 job = await sess.get(Job, job_id)
-                if iter_now is not None and iter_now != job.progress_iter:
-                    job.progress_iter = iter_now
+                if step is not None and step != job.progress_iter:
+                    job.progress_iter = step
                     await sess.commit()
-                    await self._emit(job_id, {"event": "progress", "iter": iter_now})
-            # Detect subprocess exit
-            try:
-                import os
-                os.kill(pid, 0)  # probe
-            except OSError:
+                    await self._emit(job_id, {"event": "progress", "iter": step})
+            if not alive:
                 break
 
-        self._running_proc = None
-        self._running_pid = None
-
-        # 5. Export
+        # 6) Export artifacts on remote, download what we can to local
         async with SessionLocal() as sess:
             job = await sess.get(Job, job_id)
             job.status = JobStatus.exporting
@@ -168,12 +185,11 @@ class JobManager:
         await self._emit(job_id, {"event": "exporting"})
 
         from ..exporter import run_exports
-        artifacts = await run_exports(job_id, run_dir, workspace)
+        artifacts = await run_exports(host, remote_job_dir, handle.remote_run_dir, local_job_dir)
 
         async with SessionLocal() as sess:
             job = await sess.get(Job, job_id)
             job.status = JobStatus.completed
-            from datetime import datetime
             job.finished_at = datetime.utcnow()
             for k, v in artifacts.items():
                 setattr(job, k, str(v) if v else None)

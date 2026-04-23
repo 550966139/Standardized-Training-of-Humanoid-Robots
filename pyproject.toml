@@ -1,0 +1,52 @@
+[project]
+name = "hrtrain"
+version = "0.1.0"
+description = "Standardized training of humanoid robots: import any mocap format, run simulation training, export deployable artifacts"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.6",
+    "jinja2>=3.1",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.19",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "httpx>=0.26",
+    "sse-starlette>=2.0",
+    "onnx>=1.15",
+]
+
+[project.optional-dependencies]
+loaders = [
+    "chumpy>=0.70",          # SMPL pkl load (classic deps)
+    "smplx>=0.1.28",         # SMPL family model loader
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hrtrain"]
+
+[project.scripts]
+hrtrain = "hrtrain.main:cli"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

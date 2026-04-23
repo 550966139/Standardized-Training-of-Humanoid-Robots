@@ -1,0 +1,18 @@
+<tr id="job-{{ job.id }}">
+  <td>{{ job.id }}</td>
+  <td><a href="/jobs/{{ job.id }}">{{ job.name }}</a></td>
+  <td>{{ job.task }}</td>
+  <td>{{ job.status.value if job.status else "-" }}</td>
+  <td>
+    {% if job.progress_total %}
+      <progress max="{{ job.progress_total }}" value="{{ job.progress_iter }}"></progress>
+      {{ job.progress_iter }} / {{ job.progress_total }}
+    {% else %}—{% endif %}
+  </td>
+  <td>
+    <a href="/jobs/{{ job.id }}">查看</a>
+    {% if job.status.value in ("queued", "preparing", "training") %}
+      <button hx-post="/jobs/{{ job.id }}/cancel" hx-target="#job-{{ job.id }}" hx-swap="outerHTML">取消</button>
+    {% endif %}
+  </td>
+</tr>

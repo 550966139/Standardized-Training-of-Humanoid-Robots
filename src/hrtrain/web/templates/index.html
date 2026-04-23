@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}任务列表 · HR Train{% endblock %}
+{% block content %}
+
+<section id="upload" x-data="{ upload: null }">
+  <h2>1. 上传动捕文件</h2>
+  <p class="hint">支持:BVH / SMPL (.pkl / .npz) / AMASS (.npz) / FBX</p>
+  <form hx-post="/upload" hx-encoding="multipart/form-data" hx-target="#upload-card"
+        hx-indicator="#upload-spinner">
+    <input type="file" name="file" required accept=".bvh,.pkl,.npz,.fbx">
+    <button type="submit">上传</button>
+    <span id="upload-spinner" class="htmx-indicator">上传中…</span>
+  </form>
+  <div id="upload-card"></div>
+</section>
+
+<section>
+  <h2>2. 训练任务</h2>
+  <table class="jobs">
+    <thead><tr>
+      <th>#</th><th>名称</th><th>任务</th><th>状态</th><th>进度</th><th>操作</th>
+    </tr></thead>
+    <tbody id="jobs-body">
+      {% for job in jobs %}
+        {% include "partials/job_row.html" %}
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% endblock %}

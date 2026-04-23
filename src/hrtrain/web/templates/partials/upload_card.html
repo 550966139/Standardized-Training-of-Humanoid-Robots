@@ -1,0 +1,22 @@
+<div class="upload-card">
+  <h3>上传成功 · #{{ upload.id }}</h3>
+  <p><strong>{{ upload.original_name }}</strong> ({{ (upload.size_bytes / 1024) | round(1) }} KB)</p>
+  <p>检测格式:<code>{{ detected or "unknown" }}</code></p>
+  {% if detected %}
+    <form hx-post="/jobs" hx-target="#jobs-body" hx-swap="afterbegin">
+      <input type="hidden" name="upload_id" value="{{ upload.id }}">
+      <label>任务名:<input name="name" required value="run-{{ upload.id }}"></label>
+      <label>任务类型:
+        <select name="task">
+          <option>Unitree-G1-29dof-Mimic-Dance-102</option>
+          <option>Isaac-Velocity-Rough-G1-v0</option>
+        </select>
+      </label>
+      <label>num_envs:<input name="num_envs" type="number" value="4096" min="1"></label>
+      <label>max_iterations:<input name="max_iterations" type="number" value="1500" min="1"></label>
+      <button type="submit">开始训练</button>
+    </form>
+  {% else %}
+    <p class="error">无法识别格式,不支持的扩展名或损坏文件</p>
+  {% endif %}
+</div>

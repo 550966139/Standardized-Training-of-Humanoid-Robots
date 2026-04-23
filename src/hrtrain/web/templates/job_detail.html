@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}任务 #{{ job.id }} · HR Train{% endblock %}
+{% block content %}
+
+<section hx-ext="sse" sse-connect="/sse/jobs/{{ job.id }}" sse-swap="message,progress,completed,failed">
+  <h2>任务 #{{ job.id }} — {{ job.name }}</h2>
+  <dl class="kv">
+    <dt>任务类型</dt><dd>{{ job.task }}</dd>
+    <dt>机器人</dt><dd>{{ job.robot }}</dd>
+    <dt>环境数</dt><dd>{{ job.num_envs }}</dd>
+    <dt>最大 iter</dt><dd>{{ job.max_iterations }}</dd>
+    <dt>状态</dt><dd id="status">{{ job.status.value if job.status else "-" }}</dd>
+    <dt>进度</dt><dd><progress max="{{ job.progress_total or job.max_iterations }}" value="{{ job.progress_iter }}"></progress>
+      <span id="progress-text">{{ job.progress_iter }} / {{ job.progress_total or job.max_iterations }}</span></dd>
+    {% if job.error_message %}
+      <dt>错误</dt><dd><pre>{{ job.error_message }}</pre></dd>
+    {% endif %}
+  </dl>
+</section>
+
+<section>
+  <h3>产物</h3>
+  <ul class="artifacts">
+    {% if job.video_path %}
+      <li><video controls src="/jobs/{{ job.id }}/download/video" width="480"></video></li>
+    {% endif %}
+    {% for kind, label in [
+      ('checkpoint', 'PyTorch 权重 (.pt)'),
+      ('onnx', 'ONNX 部署模型'),
+      ('video', '训练 rollout MP4'),
+      ('bvh', '机器人动作 BVH'),
+      ('fbx', '机器人动作 FBX'),
+      ('csv', '机器人动作 CSV'),
+    ] %}
+      {% set attr = ({'checkpoint':'checkpoint_path','onnx':'onnx_path','video':'video_path','bvh':'motion_bvh_path','fbx':'motion_fbx_path','csv':'motion_csv_path'})[kind] %}
+      {% if job[attr] %}
+        <li><a href="/jobs/{{ job.id }}/download/{{ kind }}">{{ label }}</a></li>
+      {% endif %}
+    {% endfor %}
+  </ul>
+</section>
+
+<script>
+  document.body.addEventListener('htmx:sseMessage', (evt) => {
+    try {
+      const d = JSON.parse(evt.detail.data);
+      if (d.iter !== undefined) {
+        document.getElementById('progress-text').textContent =
+          `${d.iter} / {{ job.progress_total or job.max_iterations }}`;
+        document.querySelector('progress').value = d.iter;
+      }
+      if (d.event) {
+        document.getElementById('status').textContent = d.event;
+      }
+    } catch(_) {}
+  });
+</script>
+
+{% endblock %}

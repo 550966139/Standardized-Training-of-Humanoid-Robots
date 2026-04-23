@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# runtime data
+data/uploads/
+data/jobs/
+data/outputs/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# logs
+*.log
+logs/
+
+# large artifacts
+*.pt
+*.pth
+*.onnx
+*.fbx
+*.bvh
+*.npz
+*.pkl
+*.mp4
+!tests/fixtures/**
+
+# env
+.env
+.env.local
+
+# OS
+Thumbs.db
